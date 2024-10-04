@@ -521,7 +521,7 @@ def usage():
 def main(argv):
     print_expired_leases = False
     sort_choice = sort_criteria["i"]
-    ommit_static_leases = False
+    dynamic_leases_only = False
 
     try:
         opts, args = getopt.getopt(argv[1:], "aibedm:46")
@@ -544,7 +544,7 @@ def main(argv):
         elif opt in ("-b", "-e"):
             sort_choice = sort_criteria[opt[1:]]
         elif opt == "-d":
-            ommit_static_leases = True
+            dynamic_leases_only = True
         elif opt == "-4":
             output_ipv6_leases = False
         elif opt == "-6":
@@ -554,26 +554,28 @@ def main(argv):
     oui_resolver = OuiResolver(oui_file)
 
     if output_ipv4_leases:
-        config_file = DhcpdConfigFile()
-        static_leases = config_file.parse(IPV4_CONFIG_FILE)
+        static_leases = {}
+        if not dynamic_leases_only:
+            config_file = DhcpdConfigFile()
+            static_leases = config_file.parse(IPV4_CONFIG_FILE)
 
-        if not ommit_static_leases:
-            leaseFile = DhcpLeaseFile()
-            leases = leaseFile.parse(IPV4_LEASE_FILE)
-            leases.update(static_leases)
+        leaseFile = DhcpLeaseFile()
+        leases = leaseFile.parse(IPV4_LEASE_FILE)
+        leases.update(static_leases)
 
         print_ipv4_leases(leases, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases, sort_choice=sort_choice)
 
         print()
 
     if output_ipv6_leases:
-        config_file = DhcpdConfigFile()
-        static_leases6 = config_file.parse(IPV6_CONFIG_FILE)
+        static_leases6 = {}
+        if not dynamic_leases_only:
+            config_file = DhcpdConfigFile()
+            static_leases6 = config_file.parse(IPV6_CONFIG_FILE)
 
-        if not ommit_static_leases:
-            leaseFile = DhcpLeaseFile()
-            leases6 = leaseFile.parse(IPV6_LEASE_FILE)
-            leases6.update(static_leases6)
+        leaseFile = DhcpLeaseFile()
+        leases6 = leaseFile.parse(IPV6_LEASE_FILE)
+        leases6.update(static_leases6)
 
         print_ipv6_leases(leases6, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases, sort_choice=sort_choice)
 
