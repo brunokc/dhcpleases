@@ -513,7 +513,7 @@ def usage():
     -e: sort output by the end of the DHCP lease.
     -d: display only dynamic leases (ommit static ones).
     -m: use oui_file to resolve MAC addresses to names. By default file
-        /usr/share/misc/oui.txt is used. out_file can end with .txt or .json extensions.
+        /usr/share/misc/oui.txt is used. oui_file can end with .txt or .json extensions.
     -4: output only IPv4 leases. By default both IPv4 and IPv6 are listed.
     -6: output only IPv6 leases. By default both IPv4 and IPv6 are listed.
 """)
