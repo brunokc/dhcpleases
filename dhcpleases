@@ -131,7 +131,7 @@ class Patterns:
     FIXED_ADDRESSV4_RE = re.compile(fr"fixed-address ({IPV4_PATTERN})")
     FIXED_ADDRESSV6_RE = re.compile(fr"fixed-address6 ({IPV6_PATTERN})")
     ETHERNET_RE = re.compile(fr"hardware ethernet ({MAC_PATTERN})")
-
+    OPTION_HOSTNAME_RE = re.compile(fr"option host-name \"(.+)\"")
 
 def _to_local_time(str):
     time = datetime.strptime(str, "%Y/%m/%d %H:%M:%S")
@@ -167,6 +167,9 @@ class DhcpdConfigFile:
             "mac": {
                 "pattern": Patterns.ETHERNET_RE,
             },
+            #"hostnameOption": {
+            #    "pattern": Patterns.OPTION_HOSTNAME_RE,
+            #},
             "bindingState": {
                 "value": "static"
             },
@@ -213,6 +216,7 @@ class DhcpdConfigFile:
 
 
     def parse(self, config_file):
+        ipless_leases = { }
         with open(config_file, "r") as config_file:
             for line in config_file:
                 #print(f"Evaluating line: {line}")
@@ -220,18 +224,23 @@ class DhcpdConfigFile:
                 if match:
                     name = match.group(1)
                     lease = self._handle_host(name, config_file)
-                    #print(f"Static lease: {name} => {lease}")
+                    #print(f"Static lease: {name} => {json.dumps(lease, indent=4, default=str)}")
                     if "ip" in lease:
                         ip = lease.pop("ip")
                     elif "ipv6" in lease:
                         ip = lease.pop("ipv6")
                     else:
-                        continue
+                        ip = None
 
                     lease["hostname"] = name
-                    self._leases[ip] = lease
+                    if ip:
+                        self._leases[ip] = lease
+                    else:
+                        mac = lease.pop("mac")
+                        assert mac
+                        ipless_leases[mac] = lease
 
-        return self._leases
+        return self._leases, ipless_leases
 
 
 class DhcpLeaseFile:
@@ -429,17 +438,15 @@ def print_ipv4_leases(leases, **kargs):
             expired = expired or "(inv.)" if not lease_valid else ""
             expired_width = 8 if print_expired_leases else 1
 
-            mac = values["mac"] if "mac" in values else ""
+            mac = values.get("mac") or ""
             manufacturer = oui_resolver.lookup(mac) or "N/A"
 
-            hostname = values["hostname"] if "hostname" in values else ""
+            hostname = values.get("hostname") or values.get("hostnameOption") or ""
 
             start_date = "<static>" if binding_state == "static" else start.strftime("%Y/%m/%d %H:%M:%S") if start else "N/A"
             end_date = "<static>" if binding_state == "static" else end.strftime("%Y/%m/%d %H:%M:%S") if end else "N/A"
             if lease_valid or print_expired_leases:
                 print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {hostname:15} {manufacturer}')
-            # elif print_expired_leases:
-                # print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {hostname:15} {manufacturer}')
         except Exception as e:
             print(f"Failed processing a DHCP entry: {e}")
             traceback.print_exc()
@@ -470,17 +477,17 @@ def print_ipv6_leases(leases, **kargs):
             expired_width = 8 if print_expired_leases else 1
 
             duid = "Unavailable"
-            mac = values["mac"] if "mac" in values else ""
+            mac = values.get("mac") or ""
             if binding_state != "static":
                 duid = values["duid"]
                 if duid.type == DuidType.LINK_LAYER_PLUS_TIME or duid.type == DuidType.LINK_LAYER:
-                    mac = values["mac"] if "mac" in values else ""
+                    mac = values.get("mac") or ""
                 else:
                     mac = "Unavailable"
 
             manufacturer = oui_resolver.lookup(mac) or "N/A"
 
-            hostname = values["hostname"] if "hostname" in values else values["dnsName"] if "dnsName" in values else ""
+            hostname = values.get("hostname") or values.get("dnsName") or ""
             if "." in hostname:
                 hostname = hostname.split(".")[0]
 
@@ -557,11 +564,15 @@ def main(argv):
         static_leases = {}
         if not dynamic_leases_only:
             config_file = DhcpdConfigFile()
-            static_leases = config_file.parse(IPV4_CONFIG_FILE)
+            static_leases, ipless_static_leases = config_file.parse(IPV4_CONFIG_FILE)
+            #print("Static Leases", json.dumps(static_leases, indent=2, default=str))
+            #print("IP-less Leases", json.dumps(ipless_static_leases, indent=2, default=str))
 
         leaseFile = DhcpLeaseFile()
         leases = leaseFile.parse(IPV4_LEASE_FILE)
+        #print("Dynamic Leases", json.dumps(leases, indent=2, default=str))
         leases.update(static_leases)
+        #print("\n\n\nMerged Leases", json.dumps(leases, indent=2, default=str))
 
         print_ipv4_leases(leases, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases, sort_choice=sort_choice)
 
