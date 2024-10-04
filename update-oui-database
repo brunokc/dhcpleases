@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+
+import csv
+import json
+import os
+import requests
+
+DOWNLOAD_BUFFER_SIZE = 64 * 1024
+DEFAULT_DB_NAME = "oui.json"
+
+SOURCES = {
+    "MA-S": "http://standards-oui.ieee.org/oui36/oui36.csv",
+    "MA-M": "http://standards-oui.ieee.org/oui28/mam.csv",
+    "MA-L": "http://standards-oui.ieee.org/oui/oui.csv",
+}
+
+# From https://stackoverflow.com/questions/16694907/download-large-file-in-python-with-requests
+def download_db(url):
+    local_filename = url.split('/')[-1]
+    # NOTE the stream=True parameter below
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(local_filename, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=DOWNLOAD_BUFFER_SIZE):
+                # If you have chunk encoded response uncomment if
+                # and set chunk_size parameter to None.
+                #if chunk:
+                f.write(chunk)
+    return local_filename
+
+def main():
+    oui = []
+    db_files = []
+    for _, url in SOURCES.items():
+        print(f"Downloading MAC database from {url}...")
+        db_file = download_db(url)
+        db_files.append(db_file)
+
+    for db_file in db_files:
+        print(f"Processsing MAC database {db_file}... ", end='')
+        rows = 0
+        with open(db_file, "r", newline="") as db:
+            csv_file = csv.DictReader(db)
+            for row in csv_file:
+                oui.append({
+                    "macPrefix": row["Assignment"].lower(),
+                    "vendorName": row["Organization Name"]
+                })
+                rows += 1
+        print(f"done ({rows} records).")
+
+    output = DEFAULT_DB_NAME
+    print(f"Writing new json database file ({output})... ", end='')
+    with open(output, "w") as oui_file:
+        json.dump(oui, oui_file)
+    print(f"done ({len(oui)} records).")
+
+    print("Deleting downloaded files...")
+    for db_file in db_files:
+        os.remove(db_file)
+
+if __name__ == "__main__":
+    main()
