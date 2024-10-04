@@ -1,0 +1,581 @@
+#!/usr/bin/env python3
+#
+from datetime import datetime, timezone
+import getopt
+import re
+import os
+import sys
+import json
+import codecs
+from enum import IntEnum
+import traceback
+import ipaddress
+
+IPV4_CONFIG_FILE = "/etc/dhcpd.conf"
+IPV4_LEASE_FILE = "/var/lib/dhcp/db/dhcpd.leases"
+IPV6_CONFIG_FILE = "/etc/dhcpd6.conf"
+IPV6_LEASE_FILE = "/var/lib/dhcp6/db/dhcpd6.leases"
+OUI_FILE = "/usr/share/misc/oui.json"
+
+# Epoch time (0 seconds since January 1, 1970) as a datetime object
+# We use this as instead of datetime.min as a way to indicate "not set"
+# datetime.min was not usable because we need a timezone aware datetime
+# and adding a negative offset to datetime.min doesn't make sense.
+epoch_datetime = datetime.fromtimestamp(0)
+
+
+class DuidType(IntEnum):
+    LINK_LAYER_PLUS_TIME = 1
+    VENDOR_SPECIFIC = 2
+    LINK_LAYER = 3
+    UUID = 4
+
+# https://www.iana.org/assignments/arp-parameters/arp-parameters.xhtml#arp-parameters-2
+class IanaHardwareType(IntEnum):
+    ETHERNET = 1
+
+class Duid:
+    def __init__(self, duid_data):
+        self._duid_data = duid_data
+        self.type = DuidType(int.from_bytes(duid_data[:2], "big"))
+
+    def __str__(self) -> str:
+        return str(self.__dict__)
+
+    @staticmethod
+    def create(duid_data):
+        type = DuidType(int.from_bytes(duid_data[:2], "big"))
+        if type == DuidType.LINK_LAYER_PLUS_TIME:
+            return DuidLinkLayerPlusTime(duid_data)
+        elif type == DuidType.VENDOR_SPECIFIC:
+            return DuidEnterprise(duid_data)
+        elif type == DuidType.LINK_LAYER:
+            return DuidLinkLayer(duid_data)
+        elif type == DuidType.UUID:
+            return DuidUuid(duid_data)
+        else:
+            raise RuntimeError("unsupported duid type")
+
+class DuidLinkLayer(Duid):
+    def __init__(self, duid_data):
+        super().__init__(duid_data)
+        self.hardware_type = IanaHardwareType(int.from_bytes(duid_data[2:4], "big"))
+        self.address = duid_data[4:]
+
+class DuidLinkLayerPlusTime(DuidLinkLayer):
+    def __init__(self, duid_data):
+        super().__init__(duid_data)
+        self.time = int.from_bytes(duid_data[4:8], "big")
+        self.address = duid_data[8:]
+
+class DuidEnterprise(Duid):
+    def __init__(self, duid_data):
+        super().__init__(duid_data)
+        self.enterprise_number = int.from_bytes(duid_data[2:6], "big")
+        self.identifier = duid_data[6:]
+
+class DuidUuid(Duid):
+    def __init__(self, duid_data):
+        super().__init__(duid_data)
+        self.uuid = duid_data[2:]
+
+class OuiResolver:
+    HEX_DIGIT_PATTERN = r"[0-9a-fA-F]"
+    OUI_PATTERN = fr"{HEX_DIGIT_PATTERN}{{2}}-{HEX_DIGIT_PATTERN}{{2}}-{HEX_DIGIT_PATTERN}{{2}}"
+    OUI_ENTRY_RE = re.compile(fr"^({OUI_PATTERN})\s+\S+\s+(.+)$")
+
+    def __init__(self, ouiFilePath):
+        self._ouis = { }
+        if ouiFilePath.endswith(".txt"):
+            self._parse_txt(ouiFilePath)
+        elif ouiFilePath.endswith(".json"):
+            self._parse_json(ouiFilePath)
+
+    def _parse_txt(self, ouiFilePath):
+        with open(ouiFilePath, "r") as ouiFile:
+            for line in ouiFile:
+                match = self.OUI_ENTRY_RE.match(line)
+                if match:
+                    mac = match.group(1).lower().replace(":", "").replace("-", "")
+                    self._ouis[mac] = match.group(2)
+
+    def _on_new_json_object(self, obj):
+        mac = obj["macPrefix"].lower().replace(":", "").replace("-", "")
+        vendor = obj["vendorName"]
+        self._ouis[mac] = vendor
+
+    def _parse_json(self, ouiFilePath):
+        with open(ouiFilePath) as ouiFile:
+            json.load(ouiFile, object_hook = self._on_new_json_object)
+
+    def lookup(self, mac):
+        if mac is None:
+            return None
+        mac_members = mac.lower().split(":")
+        vendor_prefix = "".join(mac_members[0:3])
+        return self._ouis[vendor_prefix] if vendor_prefix in self._ouis else None
+
+class Patterns:
+    IPV4_PATTERN = r"\d+\.\d+.\d+\.\d+"
+    HEX_DIGIT_PATTERN = r"[0-9a-fA-F]"
+    IPV6_PART_PATTERN = fr"{HEX_DIGIT_PATTERN}{{1,4}}"
+    IPV6_PATTERN = fr"(?:{IPV6_PART_PATTERN}|:)+"
+    IP_PATTERN = fr"(?:{IPV4_PATTERN}|{IPV6_PATTERN})"
+    MAC_PATTERN = (fr"{HEX_DIGIT_PATTERN}{{2}}:{HEX_DIGIT_PATTERN}{{2}}:{HEX_DIGIT_PATTERN}{{2}}:"
+        fr"{HEX_DIGIT_PATTERN}{{2}}:{HEX_DIGIT_PATTERN}{{2}}:{HEX_DIGIT_PATTERN}{{2}}")
+    DATE_PATTERN = r"[\d\/ :]+"
+    #HOST_PATTERN = r"^\s*[^#]*host\s+([^\s]+)"
+    #HOST_OPTION_PATTERN = r"\s*[^#]*option\s+([^\s]+)\s+([^\s]+)"
+    #FIXED_ADDRESS_PATTERN = r"\s*[^#]*fixed-address\s+({IP_PATTERN})\s+;"
+    HOST_RE = re.compile(fr"host\s+([^\s]+)")
+    FIXED_ADDRESSV4_RE = re.compile(fr"fixed-address ({IPV4_PATTERN})")
+    FIXED_ADDRESSV6_RE = re.compile(fr"fixed-address6 ({IPV6_PATTERN})")
+    ETHERNET_RE = re.compile(fr"hardware ethernet ({MAC_PATTERN})")
+
+
+def _to_local_time(str):
+    time = datetime.strptime(str, "%Y/%m/%d %H:%M:%S")
+    utctime = time.replace(tzinfo=timezone.utc)
+    localtime = utctime.astimezone() #(tzinfo=localtimezone)
+    # print(f"UTC time: {time}")
+    # print(f"Local time: {localtime}")
+    return localtime
+
+#
+# Example of static lease entry
+#
+# host host-name {
+#    hardware ethernet xx:xx:xx:xx:xx:xx;
+#    fixed-address 1.2.3.4;
+#    option host-name "dns-host-name";
+#    ddns-hostname "dns-host-name";
+# }
+#
+class DhcpdConfigFile:
+    HOST_RE = re.compile(fr"^[^#]*host\s+([^\s]+)")
+    HOST_ENTRY_END_RE = re.compile(r"^[^#]*}")
+
+    def __init__(self):
+        self._leases = { }
+        self._leasePatterns = {
+            "ip": {
+                "pattern": Patterns.FIXED_ADDRESSV4_RE,
+            },
+            "ipv6": {
+                "pattern": Patterns.FIXED_ADDRESSV6_RE,
+            },
+            "mac": {
+                "pattern": Patterns.ETHERNET_RE,
+            },
+            "bindingState": {
+                "value": "static"
+            },
+            "start": {
+                "value": epoch_datetime.strftime("%Y/%m/%d %H:%M:%S"),
+                "conversion": lambda dt : _to_local_time(dt)
+            },
+            "end": {
+                "value": epoch_datetime.strftime("%Y/%m/%d %H:%M:%S"),
+                "conversion": lambda dt : _to_local_time(dt)
+            },
+        }
+
+
+    def _handle_host(self, name, config_file):
+        properties = { }
+        for line in config_file:
+            #print(f"Line: {line}")
+            if self.HOST_ENTRY_END_RE.match(line):
+                break
+
+            for name, patternProperties in self._leasePatterns.items():
+                if "pattern" in patternProperties:
+                    #print(f"Evaluating pattern: {patternProperties['pattern']}")
+                    match = patternProperties["pattern"].search(line)
+                    if match:
+                        value = match.group(1)
+                        #print(f"{name}: {value}")
+                        if "conversion" in patternProperties:
+                            value = patternProperties["conversion"](value)
+
+                        properties[name] = value
+
+        # Add static values to the property map
+        for name, patternProperties in self._leasePatterns.items():
+            if "value" in patternProperties:
+                value = patternProperties["value"]
+                #print(f"{name}: {value}")
+                if "conversion" in patternProperties:
+                    value = patternProperties["conversion"](value)
+                properties[name] = value
+
+        return properties
+
+
+    def parse(self, config_file):
+        with open(config_file, "r") as config_file:
+            for line in config_file:
+                #print(f"Evaluating line: {line}")
+                match = self.HOST_RE.match(line)
+                if match:
+                    name = match.group(1)
+                    lease = self._handle_host(name, config_file)
+                    #print(f"Static lease: {name} => {lease}")
+                    if "ip" in lease:
+                        ip = lease.pop("ip")
+                    elif "ipv6" in lease:
+                        ip = lease.pop("ipv6")
+                    else:
+                        continue
+
+                    lease["hostname"] = name
+                    self._leases[ip] = lease
+
+        return self._leases
+
+
+class DhcpLeaseFile:
+    LEASE_RE = re.compile(fr"lease ({Patterns.IPV4_PATTERN}) {{")
+    LEASE6_RE = re.compile(fr"ia-na (.*) {{")
+    IPV6_RE = re.compile(fr"iaaddr ({Patterns.IPV6_PATTERN}) {{")
+    HOSTNAME_RE = re.compile(r"client-hostname \"([^\"]+)\"")
+    DDNS_FWD_NAME_RE = re.compile(r"set ddns-fwd-name = \"([^\"]+)\"")
+    LEASE_START_RE = re.compile(fr"starts \d ({Patterns.DATE_PATTERN})")
+    LEASE_END_RE = re.compile(fr"ends \d ({Patterns.DATE_PATTERN})")
+    CLTT_RE = re.compile(fr"cltt \d ({Patterns.DATE_PATTERN})")
+    BINDING_STATE_RE = re.compile(fr"^\s+binding state (\w+)")
+
+    def __init__(self):
+        self._leases = { }
+        self._localtimezone = datetime.now().astimezone().tzinfo
+        self._leasePatterns = {
+            #"ipv6": {
+            #    "pattern": self.IPV6_RE,
+            #},
+            "mac": {
+                "pattern": Patterns.ETHERNET_RE,
+            },
+            "hostname": {
+                "pattern": self.HOSTNAME_RE,
+            },
+            "start": {
+                "pattern": self.LEASE_START_RE,
+                "conversion": lambda dt : _to_local_time(dt)
+            },
+            "end": {
+                "pattern": self.LEASE_END_RE,
+                "conversion": lambda dt : _to_local_time(dt)
+            },
+            "cltt": {
+                "pattern": self.CLTT_RE,
+                "conversion": lambda dt : _to_local_time(dt)
+            },
+            "bindingState": {
+                "pattern": self.BINDING_STATE_RE,
+            },
+        }
+
+        self._lease6Patterns = {
+            "ipv6": {
+                "pattern": self.IPV6_RE,
+            },
+            "end": {
+                "pattern": self.LEASE_END_RE,
+                "conversion": lambda dt : _to_local_time(dt)
+            },
+            "cltt": {
+                "pattern": self.CLTT_RE,
+                "conversion": lambda dt : _to_local_time(dt)
+            },
+            "bindingState": {
+                "pattern": self.BINDING_STATE_RE,
+            },
+            "dnsName": {
+                "pattern": self.DDNS_FWD_NAME_RE,
+            },
+        }
+
+    def _process_ipv4_lease(self):
+        properties = { }
+        for line in self._leaseFile:
+            # print(f"[process_lease] Evaluating line: {line}")
+            if line.startswith("}"):
+                break
+
+            for name, patternProperties in self._leasePatterns.items():
+                match = patternProperties["pattern"].search(line)
+                if match:
+                    #print(f"Matched {name}")
+                    value = match.group(1)
+                    if "conversion" in patternProperties:
+                        value = patternProperties["conversion"](value)
+                    properties[name] = value
+
+        return properties
+
+    def _process_ipv6_lease(self):
+        properties = { }
+        for line in self._leaseFile:
+            #print(f"[process_lease] Evaluating line: {line}")
+            if line.startswith("}"):
+                break
+
+            for name, patternProperties in self._lease6Patterns.items():
+                match = patternProperties["pattern"].search(line)
+                if match:
+                    #print(f"Matched {name}")
+                    value = match.group(1)
+                    if "conversion" in patternProperties:
+                        value = patternProperties["conversion"](value)
+
+                    if name == "cltt":
+                        name = "start"
+
+                    properties[name] = value
+
+        return properties
+
+    # Parse IA-NA (Internet Authority - Non-temporary Address)
+    # From dhcpd.leases man page: "Following this tag is the combined IAID and DUID from the client
+    # for this lease"... "The IAID_DUID value is recorded as a colon-separated hexadecimal list or as
+    # "a quoted string. If it is recorded as a quoted string and it contains one or more non-printable
+    # characters, those characters are represented as octal escapes - a backslash character followed
+    # by three octal digits. The format used is governed by the lease-id-format parameter, which
+    # defaults to octal."
+    def _parse_ia_na(self, iana):
+        # print(f"IA-NA: {iana} ({len(iana)} bytes)")
+
+        if iana.startswith("\"") and iana.endswith("\""):
+            iana = iana[1:-1]
+        else:
+            raise RuntimeError("IANA in unexpected format")
+
+        hexValues = bytes(iana, "utf-8")
+        s = codecs.escape_decode(hexValues)[0]
+
+        # The first 4 bytes are the IAID. The rest (14 bytes) is the DUID
+        # Out of the DUID, the last 6 bytes are the mac address of the client
+        # print(f"IA-NA bytes: {s} ({len(s)} bytes)")
+        iaid = int.from_bytes(s[0:4], "big")
+        duid_data = s[4:]
+        # duid_type = int.from_bytes(duid_data[:2], "big")
+        # duid_value = duid_data[2:]
+
+        duid = Duid.create(duid_data)
+
+        mac = ""
+        # if duid_type == DuidType.LINK_LAYER_PLUS_TIME or duid_type == DuidType.LINK_LAYER:
+        if duid.type == DuidType.LINK_LAYER_PLUS_TIME or duid.type == DuidType.LINK_LAYER:
+            mac = ":".join(map(lambda c: "{:02x}".format(c), duid.address))
+
+        return {
+            "iaid": iaid,
+            "duid": duid,
+            # "duid": duid,
+            # "duidType": duid_type,
+            # "duidValue": duid_value,
+            "mac": mac,
+        }
+
+    def parse(self, leaseFile):
+        with open(leaseFile, "r") as self._leaseFile:
+            for line in self._leaseFile:
+                # print(f"Evaluating line: {line}")
+                match = self.LEASE_RE.match(line)
+                if match:
+                    ip = match.group(1)
+                    # print(f"Processing lease {ip}...")
+                    lease = self._process_ipv4_lease()
+                    self._leases[ip] = lease
+                    continue
+
+                match = self.LEASE6_RE.match(line)
+                if match:
+                    iana = match.group(1)
+                    lease = self._process_ipv6_lease()
+                    lease.update(self._parse_ia_na(iana))
+                    if "ipv6" in lease:
+                        ip = lease.pop("ipv6")
+                        self._leases[ip] = lease
+                    continue
+
+        return self._leases
+
+
+sort_criteria = {
+    "i": lambda x: ipaddress.ip_address(x[0]),
+    "b": lambda x: x[1]["start"],
+    "e": lambda x: x[1]["end"]
+}
+
+def print_ipv4_leases(leases, **kargs):
+    print_expired_leases = kargs["print_expired_leases"]
+    oui_resolver = kargs["oui_resolver"]
+    sort_choice = kargs["sort_choice"]
+
+    endWidth = 27 if print_expired_leases else 20
+    print('{:15} {:20} {:{endWidth}} {:18} {:15} {}'.format("IP", "Lease Start", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
+    print('{:-<15} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<18}'.format("", "", "", "", "", "", endWidth=endWidth))
+    now = datetime.now().astimezone()
+    for ip, values in sorted(leases.items(), key=sort_choice):
+        try:
+            start = values["start"]
+            end = values["end"]
+            binding_state = values["bindingState"]
+
+            lease_expired = (end < now if end and binding_state != "static" else False)
+            lease_valid = binding_state in ("active", "static")
+            expired = "(exp.)" if lease_expired else ""
+            expired = expired or "(inv.)" if not lease_valid else ""
+            expired_width = 8 if print_expired_leases else 1
+
+            mac = values["mac"] if "mac" in values else ""
+            manufacturer = oui_resolver.lookup(mac) or "N/A"
+
+            hostname = values["hostname"] if "hostname" in values else ""
+
+            start_date = "<static>" if binding_state == "static" else start.strftime("%Y/%m/%d %H:%M:%S") if start else "N/A"
+            end_date = "<static>" if binding_state == "static" else end.strftime("%Y/%m/%d %H:%M:%S") if end else "N/A"
+            if lease_valid or print_expired_leases:
+                print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {hostname:15} {manufacturer}')
+            # elif print_expired_leases:
+                # print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {hostname:15} {manufacturer}')
+        except Exception as e:
+            print(f"Failed processing a DHCP entry: {e}")
+            traceback.print_exc()
+            print(f"Entry: {ip} => {values}")
+
+
+def print_ipv6_leases(leases, **kargs):
+    print_expired_leases = kargs["print_expired_leases"]
+    oui_resolver = kargs["oui_resolver"]
+    sort_choice = kargs["sort_choice"]
+
+    endWidth = 27 if print_expired_leases else 20
+    # print('{:39} {:20} {:{endWidth}} {:18} {:15} {}'.format("IP", "Last Updated", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
+    # print('{:-<39} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<25}'.format("", "", "", "", "", "", endWidth=endWidth))
+    print('{:20} {:{endWidth}} {:18} {:15} {}'.format("Last Updated", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
+    print('{:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<25}'.format("", "", "", "", "", endWidth=endWidth))
+    now = datetime.now().astimezone()
+    for ip, values in sorted(leases.items(), key=sort_choice):
+        try:
+            start = values["start"]
+            end = values["end"]
+            binding_state = values["bindingState"]
+
+            lease_expired = (values["end"] < now)
+            lease_valid = binding_state in ("active", "static")
+            expired = "(exp.)" if lease_expired else ""
+            expired = expired or "(inv.)" if not lease_valid else ""
+            expired_width = 8 if print_expired_leases else 1
+
+            duid = "Unavailable"
+            mac = values["mac"] if "mac" in values else ""
+            if binding_state != "static":
+                duid = values["duid"]
+                if duid.type == DuidType.LINK_LAYER_PLUS_TIME or duid.type == DuidType.LINK_LAYER:
+                    mac = values["mac"] if "mac" in values else ""
+                else:
+                    mac = "Unavailable"
+
+            manufacturer = oui_resolver.lookup(mac) or "N/A"
+
+            hostname = values["hostname"] if "hostname" in values else values["dnsName"] if "dnsName" in values else ""
+            if "." in hostname:
+                hostname = hostname.split(".")[0]
+
+            # print(f"duidType: {duid.type}")
+            # v = list(map(lambda c: "{:02x}".format(c), duid._duid_data))
+            # print(f"duidValue: {v}")
+            # print(duid)
+
+            #start_date = start.strftime("%Y/%m/%d %H:%M:%S")
+            #end_date = end.strftime("%Y/%m/%d %H:%M:%S")
+            start_date = "<static>" if binding_state == "static" else start.strftime("%Y/%m/%d %H:%M:%S") if start else "N/A"
+            end_date = "<static>" if binding_state == "static" else end.strftime("%Y/%m/%d %H:%M:%S") if end else "N/A"
+            if lease_valid or print_expired_leases:
+                # print(f'{ip:40}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {dnsName:15} {manufacturer}')
+                print(f'{ip:40}')
+                print(f'{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {hostname:15} {manufacturer}')
+        except Exception as e:
+            print(f"Failed processing a DHCP entry: {e}")
+            traceback.print_exc()
+            print(f"{ip}: {values}")
+
+
+def usage():
+    name = os.path.basename(sys.argv[0])
+    print(f"""{name} [-a] [-i|-b|-e] [-d] [-m <oui_file>] [-4|-6]
+
+    -a: output all leases, including expired ones.
+    -i: sort output by IP address (default).
+    -b: sort output by the start of the DHCP lease.
+    -e: sort output by the end of the DHCP lease.
+    -d: display only dynamic leases (ommit static ones).
+    -m: use oui_file to resolve MAC addresses to names. By default file
+        /usr/share/misc/oui.txt is used. out_file can end with .txt or .json extensions.
+    -4: output only IPv4 leases. By default both IPv4 and IPv6 are listed.
+    -6: output only IPv6 leases. By default both IPv4 and IPv6 are listed.
+""")
+
+def main(argv):
+    print_expired_leases = False
+    sort_choice = sort_criteria["i"]
+    ommit_static_leases = False
+
+    try:
+        opts, args = getopt.getopt(argv[1:], "aibedm:46")
+    except getopt.GetoptError:
+        usage()
+        sys.exit(2)
+
+    oui_file = OUI_FILE
+    output_ipv4_leases = True
+    output_ipv6_leases = True
+
+    for opt, arg in opts:
+        if opt == '-h':
+            usage()
+            sys.exit(0)
+        elif opt == "-a":
+            print_expired_leases = True
+        elif opt == "-m":
+            oui_file = arg
+        elif opt in ("-b", "-e"):
+            sort_choice = sort_criteria[opt[1:]]
+        elif opt == "-d":
+            ommit_static_leases = True
+        elif opt == "-4":
+            output_ipv6_leases = False
+        elif opt == "-6":
+            output_ipv4_leases = False
+
+
+    oui_resolver = OuiResolver(oui_file)
+
+    if output_ipv4_leases:
+        config_file = DhcpdConfigFile()
+        static_leases = config_file.parse(IPV4_CONFIG_FILE)
+
+        if not ommit_static_leases:
+            leaseFile = DhcpLeaseFile()
+            leases = leaseFile.parse(IPV4_LEASE_FILE)
+            leases.update(static_leases)
+
+        print_ipv4_leases(leases, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases, sort_choice=sort_choice)
+
+        print()
+
+    if output_ipv6_leases:
+        config_file = DhcpdConfigFile()
+        static_leases6 = config_file.parse(IPV6_CONFIG_FILE)
+
+        if not ommit_static_leases:
+            leaseFile = DhcpLeaseFile()
+            leases6 = leaseFile.parse(IPV6_LEASE_FILE)
+            leases6.update(static_leases6)
+
+        print_ipv6_leases(leases6, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases, sort_choice=sort_choice)
+
+if __name__ == "__main__":
+    main(sys.argv)
