@@ -167,9 +167,9 @@ class DhcpdConfigFile:
             "mac": {
                 "pattern": Patterns.ETHERNET_RE,
             },
-            #"hostnameOption": {
-            #    "pattern": Patterns.OPTION_HOSTNAME_RE,
-            #},
+            "hostnameOption": {
+                "pattern": Patterns.OPTION_HOSTNAME_RE,
+            },
             "bindingState": {
                 "value": "static"
             },
@@ -232,12 +232,11 @@ class DhcpdConfigFile:
                     else:
                         ip = None
 
-                    lease["hostname"] = name
+                    lease["host"] = name
                     if ip:
                         self._leases[ip] = lease
                     else:
-                        mac = lease.pop("mac")
-                        assert mac
+                        mac = lease["mac"]
                         ipless_leases[mac] = lease
 
         return self._leases, ipless_leases
@@ -258,13 +257,10 @@ class DhcpLeaseFile:
         self._leases = { }
         self._localtimezone = datetime.now().astimezone().tzinfo
         self._leasePatterns = {
-            #"ipv6": {
-            #    "pattern": self.IPV6_RE,
-            #},
             "mac": {
                 "pattern": Patterns.ETHERNET_RE,
             },
-            "hostname": {
+            "clientHostname": {
                 "pattern": self.HOSTNAME_RE,
             },
             "start": {
@@ -417,14 +413,21 @@ sort_criteria = {
     "e": lambda x: x[1]["end"]
 }
 
+
 def print_ipv4_leases(leases, **kargs):
-    print_expired_leases = kargs["print_expired_leases"]
-    oui_resolver = kargs["oui_resolver"]
-    sort_choice = kargs["sort_choice"]
+    print_expired_leases = kargs.get("print_expired_leases")
+    oui_resolver = kargs.get("oui_resolver")
+    sort_choice = kargs.get("sort_choice")
+    display_client_names = kargs.get("display_client_names")
 
     endWidth = 27 if print_expired_leases else 20
-    print('{:15} {:20} {:{endWidth}} {:18} {:15} {}'.format("IP", "Lease Start", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
-    print('{:-<15} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<18}'.format("", "", "", "", "", "", endWidth=endWidth))
+    if display_client_names:
+        print('{:15} {:20} {:{endWidth}} {:18} {:15} {:15} {}'.format("IP", "Lease Start", "Lease End", "MAC", "Hostname", "Client Name", "Manufacturer", endWidth=endWidth))
+        print('{:-<15} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<15} {:-<18}'.format("", "", "", "", "", "", "", endWidth=endWidth))
+    else:
+        print('{:15} {:20} {:{endWidth}} {:18} {:15} {}'.format("IP", "Lease Start", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
+        print('{:-<15} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<18}'.format("", "", "", "", "", "", endWidth=endWidth))
+
     now = datetime.now().astimezone()
     for ip, values in sorted(leases.items(), key=sort_choice):
         try:
@@ -441,12 +444,17 @@ def print_ipv4_leases(leases, **kargs):
             mac = values.get("mac") or ""
             manufacturer = oui_resolver.lookup(mac) or "N/A"
 
-            hostname = values.get("hostname") or values.get("hostnameOption") or ""
+            hostname = values.get("host") or values.get("hostnameOption") or values.get("clientHostname") or ""
+            client_name = (values.get("clientHostname") if display_client_names else "") or ""
+            client_width = 16 if display_client_names else 0
 
             start_date = "<static>" if binding_state == "static" else start.strftime("%Y/%m/%d %H:%M:%S") if start else "N/A"
             end_date = "<static>" if binding_state == "static" else end.strftime("%Y/%m/%d %H:%M:%S") if end else "N/A"
             if lease_valid or print_expired_leases:
-                print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {hostname:15} {manufacturer}')
+                if display_client_names:
+                    print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:19}{hostname:16}{client_name:{client_width}}{manufacturer}')
+                else:
+                    print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:19}{hostname:16}{manufacturer}')
         except Exception as e:
             print(f"Failed processing a DHCP entry: {e}")
             traceback.print_exc()
@@ -454,15 +462,21 @@ def print_ipv4_leases(leases, **kargs):
 
 
 def print_ipv6_leases(leases, **kargs):
-    print_expired_leases = kargs["print_expired_leases"]
-    oui_resolver = kargs["oui_resolver"]
-    sort_choice = kargs["sort_choice"]
+    print_expired_leases = kargs.get("print_expired_leases")
+    oui_resolver = kargs.get("oui_resolver")
+    sort_choice = kargs.get("sort_choice")
+    display_client_names = kargs.get("display_client_names")
 
     endWidth = 27 if print_expired_leases else 20
     # print('{:39} {:20} {:{endWidth}} {:18} {:15} {}'.format("IP", "Last Updated", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
     # print('{:-<39} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<25}'.format("", "", "", "", "", "", endWidth=endWidth))
-    print('{:20} {:{endWidth}} {:18} {:15} {}'.format("Last Updated", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
-    print('{:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<25}'.format("", "", "", "", "", endWidth=endWidth))
+    if display_client_names:
+        print('{:20} {:{endWidth}} {:18} {:15} {:15} {}'.format("Last Updated", "Lease End", "MAC", "Hostname", "Client Name", "Manufacturer", endWidth=endWidth))
+        print('{:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<15} {:-<25}'.format("", "", "", "", "", "", endWidth=endWidth))
+    else:
+        print('{:20} {:{endWidth}} {:18} {:15} {}'.format("Last Updated", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
+        print('{:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<25}'.format("", "", "", "", "", endWidth=endWidth))
+
     now = datetime.now().astimezone()
     for ip, values in sorted(leases.items(), key=sort_choice):
         try:
@@ -487,9 +501,12 @@ def print_ipv6_leases(leases, **kargs):
 
             manufacturer = oui_resolver.lookup(mac) or "N/A"
 
-            hostname = values.get("hostname") or values.get("dnsName") or ""
+            hostname = values.get("host") or values.get("dnsName") or ""
             if "." in hostname:
                 hostname = hostname.split(".")[0]
+
+            client_name = (values.get("clientHostname") if display_client_names else "") or ""
+            client_width = 16 if display_client_names else 0
 
             # print(f"duidType: {duid.type}")
             # v = list(map(lambda c: "{:02x}".format(c), duid._duid_data))
@@ -503,21 +520,33 @@ def print_ipv6_leases(leases, **kargs):
             if lease_valid or print_expired_leases:
                 # print(f'{ip:40}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {dnsName:15} {manufacturer}')
                 print(f'{ip:40}')
-                print(f'{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {hostname:15} {manufacturer}')
+                if display_client_names:
+                    print(f'{start_date:21}{end_date:20}{expired:{expired_width}}{mac:19}{hostname:16}{client_name:{client_width}}{manufacturer}')
+                else:
+                    print(f'{start_date:21}{end_date:20}{expired:{expired_width}}{mac:19}{hostname:16}{manufacturer}')
         except Exception as e:
             print(f"Failed processing a DHCP entry: {e}")
             traceback.print_exc()
             print(f"{ip}: {values}")
 
 
+def merge_leases(dynamic_leases, static_leases, ipless_static_leases):
+    dynamic_leases.update(static_leases)
+    for ip, lease in dynamic_leases.items():
+        mac = lease.get("mac")
+        if mac in ipless_static_leases:
+            lease.update(ipless_static_leases[mac])
+
+
 def usage():
     name = os.path.basename(sys.argv[0])
-    print(f"""{name} [-a] [-i|-b|-e] [-d] [-m <oui_file>] [-4|-6]
+    print(f"""{name} [-a] [-i|-b|-e] [-c] [-d] [-m <oui_file>] [-4|-6]
 
     -a: output all leases, including expired ones.
     -i: sort output by IP address (default).
     -b: sort output by the start of the DHCP lease.
     -e: sort output by the end of the DHCP lease.
+    -c: display the client provided name (client hostname).
     -d: display only dynamic leases (ommit static ones).
     -m: use oui_file to resolve MAC addresses to names. By default file
         /usr/share/misc/oui.txt is used. oui_file can end with .txt or .json extensions.
@@ -529,9 +558,10 @@ def main(argv):
     print_expired_leases = False
     sort_choice = sort_criteria["i"]
     dynamic_leases_only = False
+    display_client_names = False
 
     try:
-        opts, args = getopt.getopt(argv[1:], "aibedm:46")
+        opts, args = getopt.getopt(argv[1:], "aibecdm:46")
     except getopt.GetoptError:
         usage()
         sys.exit(2)
@@ -550,13 +580,14 @@ def main(argv):
             oui_file = arg
         elif opt in ("-b", "-e"):
             sort_choice = sort_criteria[opt[1:]]
+        elif opt == "-c":
+            display_client_names = True
         elif opt == "-d":
             dynamic_leases_only = True
         elif opt == "-4":
             output_ipv6_leases = False
         elif opt == "-6":
             output_ipv4_leases = False
-
 
     oui_resolver = OuiResolver(oui_file)
 
@@ -565,16 +596,23 @@ def main(argv):
         if not dynamic_leases_only:
             config_file = DhcpdConfigFile()
             static_leases, ipless_static_leases = config_file.parse(IPV4_CONFIG_FILE)
-            #print("Static Leases", json.dumps(static_leases, indent=2, default=str))
-            #print("IP-less Leases", json.dumps(ipless_static_leases, indent=2, default=str))
+            # print("\n=============================\nStatic Leases", json.dumps(static_leases, indent=2, default=str))
+            # print("\n=============================\nIP-less Leases", json.dumps(ipless_static_leases, indent=2, default=str))
 
         leaseFile = DhcpLeaseFile()
         leases = leaseFile.parse(IPV4_LEASE_FILE)
-        #print("Dynamic Leases", json.dumps(leases, indent=2, default=str))
-        leases.update(static_leases)
-        #print("\n\n\nMerged Leases", json.dumps(leases, indent=2, default=str))
+        # print("\n=============================\nDynamic Leases", json.dumps(leases, indent=2, default=str))
 
-        print_ipv4_leases(leases, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases, sort_choice=sort_choice)
+        merge_leases(leases, static_leases, ipless_static_leases)
+        # for ip, lease in leases.items():
+        #     mac = lease.get("mac")
+        #     if mac in ipless_static_leases:
+        #         lease.update(ipless_static_leases[mac])
+        # leases.update(static_leases)
+        # print("\n=============================\nMerged Leases", json.dumps(leases, indent=2, default=str))
+
+        print_ipv4_leases(leases, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases,
+            sort_choice=sort_choice, display_client_names=display_client_names)
 
         print()
 
@@ -582,13 +620,16 @@ def main(argv):
         static_leases6 = {}
         if not dynamic_leases_only:
             config_file = DhcpdConfigFile()
-            static_leases6 = config_file.parse(IPV6_CONFIG_FILE)
+            static_leases6, ipless_static_leases6 = config_file.parse(IPV6_CONFIG_FILE)
+            print("\n=============================\nIP-less Leases", json.dumps(ipless_static_leases6, indent=2, default=str))
 
         leaseFile = DhcpLeaseFile()
         leases6 = leaseFile.parse(IPV6_LEASE_FILE)
-        leases6.update(static_leases6)
 
-        print_ipv6_leases(leases6, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases, sort_choice=sort_choice)
+        merge_leases(leases6, static_leases6, ipless_static_leases6)
+
+        print_ipv6_leases(leases6, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases,
+            sort_choice=sort_choice, display_client_names=display_client_names)
 
 if __name__ == "__main__":
     main(sys.argv)
