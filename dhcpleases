@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 #
-from datetime import datetime, timezone
+
 import getopt
 import re
 import os
 import sys
 import json
 import codecs
-from enum import IntEnum
 import traceback
 import ipaddress
+
+from datetime import datetime, timezone
+from enum import IntEnum
 
 IPV4_CONFIG_FILE = "/etc/dhcpd.conf"
 IPV4_LEASE_FILE = "/var/lib/dhcp/db/dhcpd.leases"
@@ -414,19 +416,73 @@ sort_criteria = {
 }
 
 
+def format_table_header(columns):
+    header = ""
+    line_separator = ""
+    for column in columns:
+        if "condition" in column:
+            if not column["condition"](column):
+                continue
+
+        column_format = column["text"]
+        line_format = "-"
+        if "width" in column:
+            width = column["width"]
+            column_format = column_format.ljust(width)
+            line_format = line_format.ljust(width, "-")
+        else:
+            line_format = line_format.ljust(18, "-")
+        column_format += " "
+        line_format += " "
+
+        header += column_format
+        line_separator += line_format
+    return header, line_separator
+
+
+def format_table_row(columns, *values):
+    row = ""
+    idx = 0
+    for column in columns:
+        if "condition" in column:
+            if not column["condition"](column):
+                idx += 1
+                continue
+
+        row_format = values[idx]
+        if "width" in column:
+            width = column["width"] + 1
+            if width > 0:
+                row_format = row_format.ljust(width)
+                # Add a space at the end if we're at or above max width to allow
+                # for field separation
+                if len(row_format) >= width and row_format[-1] != " ":
+                    row_format += " "
+            idx += 1
+
+        row += row_format
+    return row
+
+
 def print_ipv4_leases(leases, **kargs):
     print_expired_leases = kargs.get("print_expired_leases")
     oui_resolver = kargs.get("oui_resolver")
     sort_choice = kargs.get("sort_choice")
     display_client_names = kargs.get("display_client_names")
 
-    endWidth = 27 if print_expired_leases else 20
-    if display_client_names:
-        print('{:15} {:20} {:{endWidth}} {:18} {:15} {:15} {}'.format("IP", "Lease Start", "Lease End", "MAC", "Hostname", "Client Name", "Manufacturer", endWidth=endWidth))
-        print('{:-<15} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<15} {:-<18}'.format("", "", "", "", "", "", "", endWidth=endWidth))
-    else:
-        print('{:15} {:20} {:{endWidth}} {:18} {:15} {}'.format("IP", "Lease Start", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
-        print('{:-<15} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<18}'.format("", "", "", "", "", "", endWidth=endWidth))
+    columns = [
+        { "text": "IP",             "width": 15 },
+        { "text": "Lease Start",    "width": 20 },
+        { "text": "Lease End",      "width": 26 if print_expired_leases else 20 },
+        { "text": "MAC",            "width": 18 },
+        { "text": "Hostname",       "width": 15 },
+        { "text": "Client Name",    "width": 15,    "condition": lambda v: display_client_names },
+        { "text": "Manufacturer" },
+    ]
+
+    header, line_separator = format_table_header(columns)
+    print(header)
+    print(line_separator)
 
     now = datetime.now().astimezone()
     for ip, values in sorted(leases.items(), key=sort_choice):
@@ -437,9 +493,8 @@ def print_ipv4_leases(leases, **kargs):
 
             lease_expired = (end < now if end and binding_state != "static" else False)
             lease_valid = binding_state in ("active", "static")
-            expired = "(exp.)" if lease_expired else ""
-            expired = expired or "(inv.)" if not lease_valid else ""
-            expired_width = 8 if print_expired_leases else 1
+            expired_text = "(exp.)" if lease_expired else ""
+            expired_text = expired_text or "(inv.)" if not lease_valid else ""
 
             mac = values.get("mac") or ""
             manufacturer = oui_resolver.lookup(mac) or "N/A"
@@ -450,11 +505,10 @@ def print_ipv4_leases(leases, **kargs):
 
             start_date = "<static>" if binding_state == "static" else start.strftime("%Y/%m/%d %H:%M:%S") if start else "N/A"
             end_date = "<static>" if binding_state == "static" else end.strftime("%Y/%m/%d %H:%M:%S") if end else "N/A"
+            end_date += f" {expired_text}" if expired_text else ""
+
             if lease_valid or print_expired_leases:
-                if display_client_names:
-                    print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:19}{hostname:16}{client_name:{client_width}}{manufacturer}')
-                else:
-                    print(f'{ip:16}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:19}{hostname:16}{manufacturer}')
+                print(format_table_row(columns, ip, start_date, end_date, mac, hostname, client_name, manufacturer))
         except Exception as e:
             print(f"Failed processing a DHCP entry: {e}")
             traceback.print_exc()
@@ -467,15 +521,19 @@ def print_ipv6_leases(leases, **kargs):
     sort_choice = kargs.get("sort_choice")
     display_client_names = kargs.get("display_client_names")
 
-    endWidth = 27 if print_expired_leases else 20
-    # print('{:39} {:20} {:{endWidth}} {:18} {:15} {}'.format("IP", "Last Updated", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
-    # print('{:-<39} {:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<25}'.format("", "", "", "", "", "", endWidth=endWidth))
-    if display_client_names:
-        print('{:20} {:{endWidth}} {:18} {:15} {:15} {}'.format("Last Updated", "Lease End", "MAC", "Hostname", "Client Name", "Manufacturer", endWidth=endWidth))
-        print('{:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<15} {:-<25}'.format("", "", "", "", "", "", endWidth=endWidth))
-    else:
-        print('{:20} {:{endWidth}} {:18} {:15} {}'.format("Last Updated", "Lease End", "MAC", "Hostname", "Manufacturer", endWidth=endWidth))
-        print('{:-<20} {:-<{endWidth}} {:-<18} {:-<15} {:-<25}'.format("", "", "", "", "", endWidth=endWidth))
+    columns = [
+        # { "text": "IP",             "width": 15 },
+        { "text": "Lease Updated",  "width": 20 },
+        { "text": "Lease End",      "width": 26 if print_expired_leases else 20 },
+        { "text": "MAC",            "width": 18 },
+        { "text": "Hostname",       "width": 15 },
+        { "text": "Client Name",    "width": 15,    "condition": lambda v: display_client_names },
+        { "text": "Manufacturer" },
+    ]
+
+    header, line_separator = format_table_header(columns)
+    print(header)
+    print(line_separator)
 
     now = datetime.now().astimezone()
     for ip, values in sorted(leases.items(), key=sort_choice):
@@ -486,9 +544,8 @@ def print_ipv6_leases(leases, **kargs):
 
             lease_expired = (values["end"] < now)
             lease_valid = binding_state in ("active", "static")
-            expired = "(exp.)" if lease_expired else ""
-            expired = expired or "(inv.)" if not lease_valid else ""
-            expired_width = 8 if print_expired_leases else 1
+            expired_text = "(exp.)" if lease_expired else ""
+            expired_text = expired_text or "(inv.)" if not lease_valid else ""
 
             duid = "Unavailable"
             mac = values.get("mac") or ""
@@ -508,22 +565,13 @@ def print_ipv6_leases(leases, **kargs):
             client_name = (values.get("clientHostname") if display_client_names else "") or ""
             client_width = 16 if display_client_names else 0
 
-            # print(f"duidType: {duid.type}")
-            # v = list(map(lambda c: "{:02x}".format(c), duid._duid_data))
-            # print(f"duidValue: {v}")
-            # print(duid)
-
-            #start_date = start.strftime("%Y/%m/%d %H:%M:%S")
-            #end_date = end.strftime("%Y/%m/%d %H:%M:%S")
             start_date = "<static>" if binding_state == "static" else start.strftime("%Y/%m/%d %H:%M:%S") if start else "N/A"
             end_date = "<static>" if binding_state == "static" else end.strftime("%Y/%m/%d %H:%M:%S") if end else "N/A"
+            end_date += f" {expired_text}" if expired_text else ""
+
             if lease_valid or print_expired_leases:
-                # print(f'{ip:40}{start_date:21}{end_date:20}{expired:{expired_width}}{mac:18} {dnsName:15} {manufacturer}')
                 print(f'{ip:40}')
-                if display_client_names:
-                    print(f'{start_date:21}{end_date:20}{expired:{expired_width}}{mac:19}{hostname:16}{client_name:{client_width}}{manufacturer}')
-                else:
-                    print(f'{start_date:21}{end_date:20}{expired:{expired_width}}{mac:19}{hostname:16}{manufacturer}')
+                print(format_table_row(columns, start_date, end_date, mac, hostname, client_name, manufacturer))
         except Exception as e:
             print(f"Failed processing a DHCP entry: {e}")
             traceback.print_exc()
@@ -535,7 +583,14 @@ def merge_leases(dynamic_leases, static_leases, ipless_static_leases):
     for ip, lease in dynamic_leases.items():
         mac = lease.get("mac")
         if mac in ipless_static_leases:
-            lease.update(ipless_static_leases[mac])
+            ipless_lease = ipless_static_leases[mac]
+            for key in ("host", "hostnameOption"):
+                if key in ipless_lease:
+                    lease[key] = ipless_lease[key]
+
+
+def dump_leases(title, leases):
+    print(f"\n=============================\n{title}", json.dumps(leases, indent=2, default=str))
 
 
 def usage():
@@ -553,6 +608,7 @@ def usage():
     -4: output only IPv4 leases. By default both IPv4 and IPv6 are listed.
     -6: output only IPv6 leases. By default both IPv4 and IPv6 are listed.
 """)
+
 
 def main(argv):
     print_expired_leases = False
@@ -596,20 +652,13 @@ def main(argv):
         if not dynamic_leases_only:
             config_file = DhcpdConfigFile()
             static_leases, ipless_static_leases = config_file.parse(IPV4_CONFIG_FILE)
-            # print("\n=============================\nStatic Leases", json.dumps(static_leases, indent=2, default=str))
-            # print("\n=============================\nIP-less Leases", json.dumps(ipless_static_leases, indent=2, default=str))
+            # dump_leases("Static Leases", static_leases)
+            # dump_leases("IP-less Leases", ipless_static_leases)
 
         leaseFile = DhcpLeaseFile()
         leases = leaseFile.parse(IPV4_LEASE_FILE)
-        # print("\n=============================\nDynamic Leases", json.dumps(leases, indent=2, default=str))
 
         merge_leases(leases, static_leases, ipless_static_leases)
-        # for ip, lease in leases.items():
-        #     mac = lease.get("mac")
-        #     if mac in ipless_static_leases:
-        #         lease.update(ipless_static_leases[mac])
-        # leases.update(static_leases)
-        # print("\n=============================\nMerged Leases", json.dumps(leases, indent=2, default=str))
 
         print_ipv4_leases(leases, oui_resolver=oui_resolver, print_expired_leases=print_expired_leases,
             sort_choice=sort_choice, display_client_names=display_client_names)
@@ -621,7 +670,7 @@ def main(argv):
         if not dynamic_leases_only:
             config_file = DhcpdConfigFile()
             static_leases6, ipless_static_leases6 = config_file.parse(IPV6_CONFIG_FILE)
-            print("\n=============================\nIP-less Leases", json.dumps(ipless_static_leases6, indent=2, default=str))
+            # dump_leases("IP-less Leases", ipless_static_leases6)
 
         leaseFile = DhcpLeaseFile()
         leases6 = leaseFile.parse(IPV6_LEASE_FILE)
